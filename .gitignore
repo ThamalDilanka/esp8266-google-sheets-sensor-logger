@@ -1,0 +1,23 @@
+# Build output can contain compiled-in credentials.
+.pio/
+*.bin
+*.elf
+
+# Installation-specific settings.
+include/wifi_secrets.h
+include/logger_secrets.h
+.local/
+.env
+.env.*
+!.env.example
+
+# Serial captures can contain network details and private measurements.
+*.log
+
+# Generated VS Code files contain machine-specific paths.
+.vscode/*
+!.vscode/extensions.json
+
+# Python helper caches.
+__pycache__/
+*.py[cod]
