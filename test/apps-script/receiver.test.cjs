@@ -25,7 +25,8 @@ function createHarness(options = {}) {
     flushes: 0,
     timezone: options.timezone || 'Etc/GMT',
     logs: [],
-    formatCalls: [],
+    numberFormats: new Map(),
+    maxRows: options.maxRows ?? 1000,
     frozenRows: options.frozenRows || 0,
     rows: options.rows ? options.rows.map((row) => row.slice()) : [],
     sheetExists: options.sheetExists !== false,
@@ -33,7 +34,7 @@ function createHarness(options = {}) {
 
   const sheet = {
     getMaxRows() {
-      return 1000;
+      return state.maxRows;
     },
     getLastRow() {
       assert.equal(state.lockHeld, true, 'sheet access must occur while holding the script lock');
@@ -41,6 +42,8 @@ function createHarness(options = {}) {
     },
     getRange(row, column, rowCount, columnCount) {
       assert.equal(state.lockHeld, true, 'sheet access must occur while holding the script lock');
+      assert.ok(row >= 1 && rowCount >= 1 && row + rowCount - 1 <= state.maxRows,
+        'formatting and data access must stay within the allocated sheet rows');
       return {
         getValues() {
           return Array.from({ length: rowCount }, (_, rowOffset) =>
@@ -60,7 +63,11 @@ function createHarness(options = {}) {
           return this;
         },
         setNumberFormat(format) {
-          state.formatCalls.push({ row, column, rowCount, columnCount, format });
+          for (let r = row; r < row + rowCount; r += 1) {
+            for (let c = column; c < column + columnCount; c += 1) {
+              state.numberFormats.set(`${r}:${c}`, format);
+            }
+          }
           return this;
         },
       };
@@ -69,6 +76,7 @@ function createHarness(options = {}) {
       assert.equal(state.lockHeld, true, 'append must occur while holding the script lock');
       if (options.appendError) throw new Error('private append details');
       state.rows.push(row.slice());
+      state.maxRows = Math.max(state.maxRows, state.rows.length);
       return sheet;
     },
     setFrozenRows(count) {
@@ -356,6 +364,43 @@ test('doPost captures the receipt timestamp before waiting on spreadsheet prepar
   assert.equal(state.rows[1][0].toISOString(), response.timestamp);
 });
 
+test('doPost formats the newest row on every append when the sheet must grow', () => {
+  const existing = [[...HEADERS, 'Events'], ['old date', 20, 50, 25, 60, 'Window opened']];
+  const { api, state } = createHarness({ rows: existing, maxRows: 2 });
+  state.numberFormats.set('2:6', '@');
+  const snapshots = [];
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const response = json(api.doPost(event()));
+    assert.equal(response.ok, true);
+    assert.equal(state.rows[response.row - 1][0].toISOString(), response.timestamp);
+    snapshots.push(Array.from({ length: 5 }, (_, column) =>
+      state.numberFormats.get(`${response.row}:${column + 1}`)));
+  }
+
+  // Both newest rows must be formatted before another request arrives.
+  assert.deepEqual(snapshots, [
+    ['yyyy-mm-dd hh:mm:ss', '0.0', '0.0', '0.0', '0.0'],
+    ['yyyy-mm-dd hh:mm:ss', '0.0', '0.0', '0.0', '0.0'],
+  ]);
+  assert.deepEqual(state.rows.slice(0, 2), existing);
+  assert.equal(state.numberFormats.get('2:6'), '@');
+  assert.equal(state.numberFormats.has('3:6'), false);
+  assert.equal(state.numberFormats.has('4:6'), false);
+});
+
+test('doPost formats the first reading when only the header row fits', () => {
+  const { api, state } = createHarness({ maxRows: 1 });
+
+  const response = json(api.doPost(event()));
+
+  assert.equal(response.ok, true);
+  assert.equal(response.row, 2);
+  assert.equal(state.numberFormats.get('2:1'), 'yyyy-mm-dd hh:mm:ss');
+  for (let column = 2; column <= 5; column += 1) {
+    assert.equal(state.numberFormats.get(`2:${column}`), '0.0');
+  }
+});
+
 test('doPost initializes and configures a missing Measurements sheet before appending', () => {
   const { api, state } = createHarness({ sheetExists: false });
 
@@ -364,10 +409,13 @@ test('doPost initializes and configures a missing Measurements sheet before appe
   assert.equal(state.rows.length, 2);
   assert.equal(state.timezone, 'Asia/Colombo');
   assert.equal(state.frozenRows, 1);
-  assert.deepEqual(state.formatCalls, [
-    { row: 2, column: 1, rowCount: 999, columnCount: 1, format: 'yyyy-mm-dd hh:mm:ss' },
-    { row: 2, column: 2, rowCount: 999, columnCount: 4, format: '0.0' },
-  ]);
+  for (const row of [2, 1000]) {
+    assert.equal(state.numberFormats.get(`${row}:1`), 'yyyy-mm-dd hh:mm:ss');
+    for (let column = 2; column <= 5; column += 1) {
+      assert.equal(state.numberFormats.get(`${row}:${column}`), '0.0');
+    }
+  }
+  assert.equal(state.numberFormats.has('1:1'), false);
 });
 
 test('doPost refuses wrong existing headers and preserves all existing data', () => {
@@ -421,10 +469,13 @@ test('setup creates the header and applies spreadsheet configuration under a loc
   assert.deepEqual(state.rows, [HEADERS]);
   assert.equal(state.timezone, 'Asia/Colombo');
   assert.equal(state.frozenRows, 1);
-  assert.deepEqual(state.formatCalls, [
-    { row: 2, column: 1, rowCount: 999, columnCount: 1, format: 'yyyy-mm-dd hh:mm:ss' },
-    { row: 2, column: 2, rowCount: 999, columnCount: 4, format: '0.0' },
-  ]);
+  for (const row of [2, 1000]) {
+    assert.equal(state.numberFormats.get(`${row}:1`), 'yyyy-mm-dd hh:mm:ss');
+    for (let column = 2; column <= 5; column += 1) {
+      assert.equal(state.numberFormats.get(`${row}:${column}`), '0.0');
+    }
+  }
+  assert.equal(state.numberFormats.has('1:1'), false);
   assert.equal(state.flushes, 1);
   assert.equal(state.lockReleases, 1);
   assert.deepEqual(state.logs, ['Climate logger setup complete: Measurements is ready.']);

@@ -1,6 +1,6 @@
 # Temperature Logger for Google Sheets
 
-Log temperature and humidity to a private Google Sheet, then chart how conditions change over time. This ESP8266 project uses a Wemos D1 mini and two DHT22 sensors, with a sample after startup and every five minutes, plus LED feedback for connection, successful saves, and failures.
+Log temperature and humidity to a private Google Sheet, then chart how conditions change over time. This ESP8266 project uses a Wemos D1 mini and two DHT22 sensors, collecting readings every 30 seconds and uploading a five-minute trimmed mean, plus LED feedback for connection, successful saves, and failures.
 
 Choose two measurement locations, give them meaningful names in your dashboard, and adapt the sampling interval and spreadsheet time zone to your experiment. Once configured, the device runs from USB power without a computer or serial monitor. The current reference build supports **two DHT22 sensors**; indoor/outdoor monitoring is its original use case.
 
@@ -21,14 +21,14 @@ The same logging workflow can compare two nearby rooms, two areas of one room, o
 The ESP8266 sends both sensors' readings in one HTTPS request. Google Apps Script adds a timestamp, appends the row to the private spreadsheet, and returns a save acknowledgment. Follow the [chart instructions](#google-sheets-charts) to create the charts in Sheets; the diagram illustrates the workflow.
 
 - **Two sensors, one row:** temperature in °C and relative humidity in %RH from both locations.
-- **Automatic operation:** a sample after startup, followed by a five-minute sampling schedule and automatic Wi-Fi reconnection.
+- **Automatic operation:** readings every 30 seconds, one aggregated report per five-minute window, and automatic Wi-Fi reconnection. The first report waits for a full window after startup checks.
 - **Visible feedback:** a single built-in LED shows connection attempts, connection success, confirmed saves, and failures.
 - **Verified delivery:** HTTPS certificate validation, a shared device token, and a saved-row acknowledgment from Google.
 - **Small setup:** no always-on computer, separate server, SD card, RTC, or database to maintain.
 - **Bench diagnostics:** separate firmware for checking Wi-Fi and sensor communication.
 - **Google Sheets charts:** [dashboard instructions](#google-sheets-charts) for custom sensor labels, temperature and humidity trends, and the temperature difference between the two locations.
 
-Keep the controller indoors and dry. The reference wiring labels sensor 1 as indoor and sensor 2 as outdoor. The implementation has been bench-tested with a real D1 mini and Google Sheets; this does not establish long-term reliability or sensor calibration. Follow the [verification steps](#5-verify-the-first-readings) for your own installation.
+Keep the controller indoors and dry. The reference wiring labels sensor 1 as indoor and sensor 2 as outdoor. The windowed logger was bench-tested with a real D1 mini, two DHT22 sensors, and Google Sheets on **2026-09-10**: two consecutive windows each collected 10 valid pairs, their trimmed means matched independent calculations, and Google acknowledged both saves. This does not establish sensor calibration or long-term reliability. Follow the [verification steps](#5-verify-the-first-readings) for your own installation.
 
 ## Hardware and wiring
 
@@ -124,9 +124,13 @@ Replace `/dev/ttyUSB0` with your actual port, such as `COM3` on Windows or a `/d
 
 ### 5. Verify the first readings
 
-Press RESET after opening the serial monitor if you missed startup. The logger waits for the sensors, reads both, connects to Wi-Fi, synchronizes network time, and submits the sample. Look for `[PASS] Saved Google Sheet row ...` and the four-flash LED pattern.
+Press RESET after opening the serial monitor if you missed startup. The logger waits for the sensors, attempts Wi-Fi connection and network-time synchronization, then starts its first five-minute window. Expect `[SAMPLE]` lines about 30 seconds apart, each with the current valid-pair count and four raw readings. There is no immediate startup upload.
 
-Check that `Measurements` contains a new row with four numeric readings. Leave the device running for another five-minute interval and confirm a second row. Network setup and upload time mean spreadsheet timestamps will not be exactly five minutes apart.
+After five minutes of collection, expect `[REPORT] Trimmed mean of ...`, followed by `[PASS] Saved Google Sheet row ...` and the four-flash LED pattern. Check that `Measurements` contains a new row with four numeric readings to one decimal place. A healthy window normally contains 10 valid pairs; at least 6 are required.
+
+Leave the device running through a second window and confirm a second row. For one complete window, record the serial readings, sort each of the four fields independently, remove one lowest and one highest value, and average the rest. The result rounded to one decimal should match that sheet row. Network setup and upload time mean spreadsheet timestamps will not be exactly five minutes apart.
+
+For failure recovery, power off before disconnecting either sensor's DATA lead, then restart: raw pairs should be rejected and the five-minute report skipped with the failure LED. Power off, restore the wiring, and restart to confirm valid reports resume. Temporarily turning off the Wi-Fi access point can also verify that unconfirmed windows are discarded and later windows recover without duplicate POSTs.
 
 ## Google Sheets charts
 
@@ -182,17 +186,22 @@ Each successful request appends these columns to the `Measurements` tab. The cur
 
 The protocol fields (`indoor_t`, `indoor_rh`, `outdoor_t`, `outdoor_rh`) and serial labels follow the same mapping. Sensor 1 can physically be in a different location; change its dashboard label to describe that location. Do not rename `Measurements` headers in the sheet alone: the receiver checks them exactly and will reject a mismatch.
 
-The receiver formats readings to one decimal place and sets the spreadsheet time zone to **Asia/Colombo (UTC+05:30)**. Acknowledgments use UTC ISO timestamps. Network time on the ESP is used for certificate verification; the device does not supply the sheet timestamp.
+The receiver formats each appended timestamp as `yyyy-mm-dd hh:mm:ss` and readings to one decimal place, including when the append expands the sheet. Timestamps remain real spreadsheet dates. The spreadsheet time zone is **Asia/Colombo (UTC+05:30)**; acknowledgments use UTC ISO timestamps. Network time on the ESP is used for certificate verification; the device does not supply the sheet timestamp.
 
-- Both sensors must return finite values within **−40 to 80 °C** and **0 to 99.9 %RH**. If either fails, the whole sample is skipped. These are validation bounds, not a guarantee of sensor accuracy throughout the range.
-- There is **no offline storage or backfill**. Power loss, sensor errors, and unavailable internet can leave gaps. The device takes a new sample on the next scheduled attempt.
-- The sampling interval is **300,000 ms, measured from the start of each attempt**. Rebooting starts a new schedule and triggers a startup sample; it is not aligned to wall-clock five-minute boundaries.
-- A measurement POST is sent once. Google redirects are followed with GET requests to retrieve the reply. If the reply is lost, the row may already exist; the firmware reports an unconfirmed save and does not resend that sample.
+- **Acquisition:** every **30,000 ms**, prime both DHT22s, wait **2,200 ms**, then force a fresh read from each. Humidity and temperature use the same DHT transaction. The [AM2302 manual](https://www.aosong.com/uploadfiles/2025/04/20250417105409216.pdf) requires more than two seconds between reads for updated data; the firmware also preserves a refresh gap between the last read and the next prime.
+- **Aggregation:** retain at most **10 complete pairs in RAM** per **300,000 ms** window. Sort each field independently, discard exactly one lowest and one highest value, and average the remainder. With 10 valid pairs, 8 values contribute per field. The upload still contains only the four aggregated fields, rounded to one decimal; raw values and counts appear only in serial output.
+- Both sensors must return finite values within **−40 to 80 °C** and **0 to 99.9 %RH**. If either fails, discard the entire pair without substituting older values. At least **6 valid pairs** are required to report a window; 6–9 pairs use the same trimming rule, and fewer than 6 skip the upload and show failure. These are validation bounds, not a guarantee of sensor accuracy throughout the range.
+- **Timing:** reports represent the preceding five-minute collection window, ending approximately at the sheet timestamp. The timestamp is still Google's receipt time, so network delay moves it later than the actual window end. Windows start after startup checks and are not aligned to wall-clock five-minute boundaries. Rebooting discards RAM samples and starts a new full window.
+- **Missed slots:** sensor reads and network operations are blocking. Slow Wi-Fi/TLS/uploads can reduce the next window's sample count. Sampling resumes with one new observation and at least 30 seconds between attempt starts; missed slots are never filled with rapid catch-up reads. Report boundaries stay on the original five-minute schedule. Readings completed after their window ends are discarded, and fully missed windows are skipped without catch-up uploads.
+- There is **no persistent offline storage or backfill**. The buffer is cleared when a window closes, before its upload attempt, regardless of validity or delivery success. Power loss, sensor errors, and unavailable internet can leave gaps.
+- A measurement POST is sent once per eligible window. Google redirects are followed with GET requests to retrieve the reply. If the reply is lost, the row may already exist; the firmware reports an unconfirmed save and does not resend that window.
 - The HTTP client allows a **60-second response-header inactivity wait** for each POST or response GET, accommodating slower Apps Script processing. This is not a total upload deadline. Serial output records request timings and Wi-Fi signal strength to help distinguish slow responses from connection problems.
 - The design uses one shared token and no device identifier, so the sheet is intended for **one controller with two sensors**.
 - There are no notifications, remote configuration, or over-the-air firmware updates. Changes to firmware settings require a USB rebuild/upload.
 
 The receiver also depends on [Google Apps Script availability and quotas](https://developers.google.com/apps-script/guides/services/quotas). Keep measurement headers intact; use another tab for analysis and charts.
+
+The trimmed mean reduces isolated fluctuations and represents the window better than a single spot reading. It does not correct sunlight heating, condensation, calibration offsets, or sensor placement. It also smooths brief real changes, so keep recording ventilation-event times and use the outdoor rain/sun shield.
 
 ## Troubleshooting
 
@@ -202,6 +211,8 @@ The receiver also depends on [Google Apps Script availability and quotas](https:
 | No serial port or upload fails | Use a data-capable cable, check the board's USB serial driver and OS permissions, close other monitors, and specify the actual port; WSL may need USB reattachment |
 | Wi-Fi connection times out | Check the exact SSID/password, 2.4 GHz availability, and signal at the installed location; use `wifi_check` below |
 | Connected light appears, but there are no saved rows | Wi-Fi alone does not prove internet access; inspect serial output for time-sync, HTTPS, configuration, or acknowledgment errors |
+| No row immediately after reset | The first report waits for a full five-minute window after startup checks; look for `[SAMPLE]` counts, then `[REPORT]` or a skipped-window explanation |
+| Newest timestamp has a different format until the next save | Older receiver versions formatted only before appending, so newly allocated rows could retain the default date display. Replace Apps Script with the current `Code.gs`, save, and deploy a new version of the existing endpoint. Run `setup()` to refresh existing row formats immediately |
 | Network time synchronization times out | Check internet/DNS access and whether the network permits NTP to `time.google.com` or `pool.ntp.org` |
 | Google POST reports `read Timeout` | The HTTP client stopped waiting for a response. Check the sheet before assuming the sample was lost; the request may already have saved it. Firmware now allows 60 seconds for response-header inactivity, and the next scheduled sample can recover without a reset |
 | Three rapid flashes keep repeating | Read the accompanying `[SKIP]` or `[FAIL]` serial message; the pattern covers several failure types |
@@ -255,12 +266,14 @@ These commands do not need a connected board or Google credentials. A fresh chec
 | Check | Coverage |
 | --- | --- |
 | Apps Script tests | Token and measurement validation, numeric rows, headers, setup, locking, and storage failures using substitutes for Google services |
-| Native firmware tests | Request encoding, measurement/URL validation, acknowledgment parsing, response-size boundaries, and LED timing/transitions |
+| Native firmware tests | Trimmed means, valid-pair thresholds, window reset, delayed sampling/uploads, timer rollover, request encoding, measurement/URL validation, acknowledgment parsing, response-size boundaries, and LED timing/transitions |
 | Three firmware builds | Compilation of the logger and both diagnostics for the ESP8266 |
 | `python3 scripts/check_receiver.py` | Optional live endpoint health and invalid-token rejection; requires a configured URL, creates no measurement rows |
 | Live device verification | Real sensor reads, Wi-Fi/TLS, saved-row acknowledgments, and sampling cadence; follow [first-reading verification](#5-verify-the-first-readings) |
 
 Local tests do not establish physical wiring, optical LED appearance, Google account permissions, sensor accuracy, or long-duration reliability. After firmware or receiver changes, confirm real saved rows on hardware.
+
+The 2026-09-10 hardware check observed sample intervals of **29.999–30.051 seconds**, a report interval of **299.984 seconds**, and Google receipt timestamps **300.102 seconds** apart, with no sensor or network errors in the two windows. Timing was measured with the capture host's `CLOCK_MONOTONIC_RAW`: its adjusted clock ran slower and initially made the cadence appear short. Failure recovery and optical LED appearance remain manual checks; the successful-save run does not validate them.
 
 ## Project structure
 
@@ -276,18 +289,20 @@ Local tests do not establish physical wiring, optical LED appearance, Google acc
 ├── include/
 │   ├── *.example.h                 # Empty local-settings templates
 │   ├── logger_protocol.h           # Measurement and acknowledgment interface
+│   ├── sampling_window.h           # Sampling/report timing and bounded window interface
 │   ├── bounded_response.h          # Size-limited HTTP response buffer
 │   ├── status_led.h                # LED timing and state transitions
 │   └── google_root_ca.h            # Google HTTPS trust anchors
 ├── src/
-│   ├── main.cpp                    # Five-minute logger and device integration
+│   ├── main.cpp                    # Sensor collection, reporting, and device integration
+│   ├── sampling_window.cpp         # Paired sample validation, scheduling, and trimmed means
 │   ├── logger_protocol.cpp         # Validation, form encoding, reply parsing
 │   ├── wifi_check.cpp              # Standalone Wi-Fi diagnostic
 │   └── sensor_check.cpp            # Standalone sensor diagnostic
 ├── scripts/check_receiver.py       # Non-measurement endpoint checks
 └── test/
     ├── apps-script/receiver.test.cjs
-    └── logger/test_main.cpp
+    └── logger/                     # Protocol, LED, response, and sampling tests
 ```
 
 ## Customize for your use case
@@ -299,7 +314,7 @@ The reference build provides two fixed sensor channels. You can adapt their loca
 | Sensor locations and chart labels | Choose two locations within the wiring limits; edit the `Dashboard` header cells described in the [chart instructions](#google-sheets-charts). The log retains its existing channel names |
 | Wi-Fi network | Edit `include/wifi_secrets.h`, rebuild, and upload `d1_mini` |
 | Google endpoint or device token | Edit `include/logger_secrets.h`; keep the token equal to `DEVICE_TOKEN` in Script Properties; rebuild and upload |
-| Sampling interval | Change `LOG_INTERVAL_MS` in `src/main.cpp`, rebuild/upload, and verify the new cadence |
+| Sampling/report intervals | Change `SAMPLE_INTERVAL_MS` / `REPORT_INTERVAL_MS` in `include/sampling_window.h` (30,000 / 300,000 ms). Keep a whole number of sample intervals per report and DHT-safe timing; capacity is derived from their ratio. Review RAM use and `MIN_VALID_SAMPLES` (6), then test, rebuild/upload, and verify the cadence |
 | HTTP response wait | `HTTP_TIMEOUT_MS` in `src/main.cpp` is 60,000 ms; it must fit the HTTP client's 16-bit millisecond parameter and allow for Apps Script processing. Verify real saves after changing it |
 | Spreadsheet time zone | Change `TIME_ZONE` in `apps-script/Code.gs`, update the deployed version, and run `setup()`; this affects the whole spreadsheet |
 | Receiver logic | Update Apps Script, then **Deploy → Manage deployments → Edit → New version → Deploy** to retain the existing URL |

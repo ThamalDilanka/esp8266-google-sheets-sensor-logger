@@ -10,6 +10,7 @@
 #include "bounded_response.h"
 #include "google_root_ca.h"
 #include "logger_protocol.h"
+#include "sampling_window.h"
 #include "status_led.h"
 
 #if __has_include("wifi_secrets.h")
@@ -26,9 +27,7 @@
 
 namespace {
 
-constexpr unsigned long LOG_INTERVAL_MS = 300000UL;
 constexpr unsigned long SENSOR_STARTUP_MS = 2500UL;
-constexpr unsigned long SENSOR_REFRESH_MS = 2200UL;
 constexpr unsigned long WIFI_TIMEOUT_MS = 30000UL;
 constexpr unsigned long TIME_SYNC_TIMEOUT_MS = 20000UL;
 // Apps Script may spend 30 seconds waiting for its sheet lock, in addition to
@@ -40,7 +39,7 @@ constexpr unsigned int MAX_RESPONSE_REDIRECTS = 2;
 DHT indoorDht(D1, DHT22);
 DHT outdoorDht(D2, DHT22);
 BearSSL::X509List googleTrustAnchors(GOOGLE_ROOT_CA);
-unsigned long lastLogAttemptMs = 0;
+sensor_sampling::Window samplingWindow;
 status_led::Pattern ledPattern;
 Ticker ledTicker;
 bool wifiWasConnected = false;
@@ -148,7 +147,7 @@ bool readMeasurements(logger_protocol::Measurements& measurements) {
     // Prime both sensors, then wait long enough for their next measurements.
     (void)indoorDht.readHumidity(true);
     (void)outdoorDht.readHumidity(true);
-    delay(SENSOR_REFRESH_MS);
+    delay(sensor_sampling::SENSOR_REFRESH_MS);
 
     const bool indoorOk = readSensor(indoorDht, "Indoor (D1/GPIO5)",
                                      measurements.indoorTemperature,
@@ -157,14 +156,29 @@ bool readMeasurements(logger_protocol::Measurements& measurements) {
                                       measurements.outdoorTemperature,
                                       measurements.outdoorHumidity);
     if (!indoorOk || !outdoorOk) {
-        Serial.println("[SKIP] Incomplete sensor sample; nothing will be uploaded.");
+        Serial.println("[SKIP] Incomplete sensor pair; discarded from this window.");
         return false;
     }
+    return true;
+}
 
-    Serial.printf("[PASS] Indoor %.1f C, %.1f %%RH | Outdoor %.1f C, %.1f %%RH\n",
+void collectSample() {
+    logger_protocol::Measurements measurements{};
+    const bool sensorsOk = readMeasurements(measurements);
+    const bool accepted = samplingWindow.addReading(millis(), measurements);
+    if (!sensorsOk || !accepted) {
+        if (sensorsOk) {
+            Serial.println("[SKIP] Sensor read crossed the window boundary; pair discarded.");
+        }
+        showLed(status_led::Signal::Failure, "Sensor sample skipped: repeating three rapid flashes.");
+        return;
+    }
+
+    Serial.printf("[SAMPLE] %u/%u valid pairs | Indoor %.1f C, %.1f %%RH | Outdoor %.1f C, %.1f %%RH\n",
+                  static_cast<unsigned int>(samplingWindow.validCount()),
+                  static_cast<unsigned int>(sensor_sampling::SAMPLES_PER_REPORT),
                   measurements.indoorTemperature, measurements.indoorHumidity,
                   measurements.outdoorTemperature, measurements.outdoorHumidity);
-    return true;
 }
 
 bool isRedirectStatus(int status) {
@@ -314,13 +328,22 @@ bool uploadMeasurements(const logger_protocol::Measurements& measurements,
     return readAcknowledgment(request, status, acknowledgment);
 }
 
-void logOnce() {
+void reportWindow() {
+    const size_t validCount = samplingWindow.validCount();
     logger_protocol::Measurements measurements{};
-    if (!readMeasurements(measurements)) {
-        showLed(status_led::Signal::Failure, "Sensor failure: repeating three rapid flashes.");
+    if (!samplingWindow.finishReport(millis(), measurements)) {
+        Serial.printf("[SKIP] Window has %u/%u valid pairs (minimum %u), or expired; no upload.\n",
+                      static_cast<unsigned int>(validCount),
+                      static_cast<unsigned int>(sensor_sampling::SAMPLES_PER_REPORT),
+                      static_cast<unsigned int>(sensor_sampling::MIN_VALID_SAMPLES));
+        showLed(status_led::Signal::Failure, "Window skipped: repeating three rapid flashes.");
         return;
     }
 
+    Serial.printf("[REPORT] Trimmed mean of %u valid pairs (drop low/high per field) | Indoor %.1f C, %.1f %%RH | Outdoor %.1f C, %.1f %%RH\n",
+                  static_cast<unsigned int>(validCount),
+                  measurements.indoorTemperature, measurements.indoorHumidity,
+                  measurements.outdoorTemperature, measurements.outdoorHumidity);
     logger_protocol::Acknowledgment acknowledgment{};
     if (uploadMeasurements(measurements, acknowledgment)) {
         Serial.printf("[PASS] Saved Google Sheet row %ld at %s.\n",
@@ -351,15 +374,25 @@ void setup() {
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
 
-    lastLogAttemptMs = millis();
-    logOnce();
+    // Do initial network setup before starting the first complete window.
+    if (!ensureWiFi() || !ensureNetworkTime()) {
+        showLed(status_led::Signal::Failure, "Startup network check failed: repeating three rapid flashes.");
+    }
+    samplingWindow.begin(millis());
+    Serial.printf("[INFO] Sampling every %lu s; first report after %lu s; minimum %u/%u valid pairs.\n",
+                  static_cast<unsigned long>(sensor_sampling::SAMPLE_INTERVAL_MS / 1000),
+                  static_cast<unsigned long>(sensor_sampling::REPORT_INTERVAL_MS / 1000),
+                  static_cast<unsigned int>(sensor_sampling::MIN_VALID_SAMPLES),
+                  static_cast<unsigned int>(sensor_sampling::SAMPLES_PER_REPORT));
 }
 
 void loop() {
     observeWiFiChanges();
-    if (millis() - lastLogAttemptMs >= LOG_INTERVAL_MS) {
-        lastLogAttemptMs = millis();
-        logOnce();
+    if (samplingWindow.reportDue(millis())) {
+        // Consume a completed window before uploading or collecting a new pair.
+        reportWindow();
+    } else if (samplingWindow.beginSample(millis())) {
+        collectSample();
     }
     delay(50);
 }

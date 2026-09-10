@@ -65,11 +65,14 @@ function doPost(e) {
       parsed.values.outdoor_t,
       parsed.values.outdoor_rh,
     ]);
+    const row = sheet.getLastRow();
+    // Appending can grow the grid beyond the rows formatted by prepareSheet.
+    formatMeasurementRows(sheet, row, 1);
     SpreadsheetApp.flush();
 
     return jsonResponse({
       ok: true,
-      row: sheet.getLastRow(),
+      row,
       timestamp: receivedAt.toISOString(),
     });
   } catch (ignored) {
@@ -190,12 +193,14 @@ function prepareSheet(spreadsheet) {
   }
 
   sheet.setFrozenRows(1);
-  const dataRowCount = sheet.getMaxRows() - 1;
-  if (dataRowCount > 0) {
-    sheet.getRange(2, 1, dataRowCount, 1).setNumberFormat('yyyy-mm-dd hh:mm:ss');
-    sheet.getRange(2, 2, dataRowCount, 4).setNumberFormat('0.0');
-  }
+  formatMeasurementRows(sheet, 2, sheet.getMaxRows() - 1);
   return sheet;
+}
+
+function formatMeasurementRows(sheet, firstRow, rowCount) {
+  if (rowCount <= 0) return;
+  sheet.getRange(firstRow, 1, rowCount, 1).setNumberFormat('yyyy-mm-dd hh:mm:ss');
+  sheet.getRange(firstRow, 2, rowCount, 4).setNumberFormat('0.0');
 }
 
 function releaseLock(lock) {

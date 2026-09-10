@@ -13,6 +13,8 @@
 using logger_protocol::Acknowledgment;
 using logger_protocol::Measurements;
 
+void runSamplingTests();
+
 void test_led_connecting_blinks_slowly_until_replaced() {
     status_led::Pattern led;
     led.show(status_led::Signal::Connecting, 1000);
@@ -288,6 +290,8 @@ void test_acknowledgment_rejects_false_loose_or_malformed_success() {
 
 int main(int, char**) {
     UNITY_BEGIN();
+    runSamplingTests();
+    Unity.TestFile = __FILE__;
     RUN_TEST(test_led_connecting_blinks_slowly_until_replaced);
     RUN_TEST(test_led_connected_lights_for_three_seconds_then_stays_off);
     RUN_TEST(test_led_saved_gives_two_separate_pairs_and_stops);
